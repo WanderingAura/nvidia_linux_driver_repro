@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_descriptor_heap : require
+
+// Control case for heap_dynamic.comp. Byte-for-byte the same work, except
+// that every heap index is a literal compile-time constant. If this passes
+// while heap_dynamic.comp fails, the only variable is constant vs dynamic
+// heap indexing.
+
+layout(local_size_x = 1) in;
+
+layout(descriptor_heap) buffer Buf {
+    uint values[];
+} bufs[];
+
+// Heap layout (written by the host):
+//   slot 0..3 : input buffers, containing 1000..1003
+//   slot 4    : output buffer, zeroed
+//   slot 5    : control buffer, containing 0
+
+void main() {
+    bufs[4].values[0] = bufs[0].values[0];
+    bufs[4].values[1] = bufs[1].values[0];
+    bufs[4].values[2] = bufs[2].values[0];
+    bufs[4].values[3] = bufs[3].values[0];
+}

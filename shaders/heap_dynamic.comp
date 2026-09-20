@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_descriptor_heap : require
+// glslang requires this to be requested for any variable index into a
+// descriptor_heap array. The nonuniformEXT() qualifier is deliberately NOT
+// applied: the index below is uniform, and the resulting SPIR-V declares no
+// ShaderNonUniform capability (verify with spirv-dis).
+#extension GL_EXT_nonuniform_qualifier : require
+
+// Reads four storage buffers out of the descriptor heap using a DYNAMIC
+// index, and copies their contents into the output buffer.
+//
+// `base` is loaded from a buffer the host initialises to 0, so the index
+// `base + N` is not a compile-time constant and cannot be folded, but it is
+// still uniform across all invocations (there is only one invocation, and
+// every invocation would load the same value regardless). No nonuniformEXT
+// is needed or used.
+//
+// Compare against heap_constant.comp, which is identical except that its
+// indices are literal constants.
+
+layout(local_size_x = 1) in;
+
+layout(descriptor_heap) buffer Buf {
+    uint values[];
+} bufs[];
+
+// Heap layout (written by the host):
+//   slot 0..3 : input buffers, containing 1000..1003
+//   slot 4    : output buffer, zeroed
+//   slot 5    : control buffer, containing 0
+
+void main() {
+    uint base = bufs[5].values[0];  // == 0, but not known at compile time
+
+    bufs[4].values[0] = bufs[base + 0].values[0];
+    bufs[4].values[1] = bufs[base + 1].values[0];
+    bufs[4].values[2] = bufs[base + 2].values[0];
+    bufs[4].values[3] = bufs[base + 3].values[0];
+}

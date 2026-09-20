@@ -1,0 +1,26 @@
+#version 450
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// Same as heap_pushdata.comp but the host pushes a NON-ZERO index (1).
+// The fragment-stage repro fails only for non-zero push-sourced indices, so
+// this determines whether that is specific to the fragment stage or applies
+// to compute as well. All four outputs read heap slot pc.idx, so every
+// output must equal the value in input buffer 1 (== 1001).
+
+layout(local_size_x = 1) in;
+
+layout(descriptor_heap) buffer Buf {
+    uint values[];
+} bufs[];
+
+layout(push_constant) uniform PushData {
+    uint idx;  // host pushes 1
+} pc;
+
+void main() {
+    bufs[4].values[0] = bufs[pc.idx].values[0];
+    bufs[4].values[1] = bufs[pc.idx].values[0];
+    bufs[4].values[2] = bufs[pc.idx].values[0];
+    bufs[4].values[3] = bufs[pc.idx].values[0];
+}
