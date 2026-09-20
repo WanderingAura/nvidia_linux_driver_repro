@@ -1,15 +1,17 @@
 # VK_EXT_descriptor_heap: fragment shader reads the wrong descriptor for any heap index other than 0
 
 Reading a `layout(descriptor_heap)` array **from a fragment shader** at any
-index other than `0` returns the wrong descriptor on NVIDIA 610.57.04. Index
-`0` is correct. A literal constant index of `1` is enough to trigger it —
-there is no push data, no dynamic index and no `nonuniformEXT` involved.
+index other than `0` returns the wrong descriptor on NVIDIA. Index `0` is
+correct. A literal constant index of `1` is enough to trigger it — there is
+no push data, no dynamic index and no `nonuniformEXT` involved.
+
+Reproduced identically on **two driver branches**: 610.57.04 and 615.71.09.
 
 The same heap, same descriptors and equivalent shader logic read correctly at
 every index from a **compute** shader on the same device, so this appears to
 be specific to the fragment stage.
 
-Mesa RADV 26.2.2 renders every case correctly from the same SPIR-V and the
+Mesa RADV 26.2.3 renders every case correctly from the same SPIR-V and the
 same API calls.
 
 ## Environment
@@ -17,12 +19,17 @@ same API calls.
 | | |
 |---|---|
 | GPU | NVIDIA GeForce RTX 4060 |
-| Driver | 610.57.04 (`driverVersion` 610.228.256) |
-| OS | Linux (CachyOS, kernel 7.2.3) |
+| Driver | **615.71.09** (`driverVersion` 615.284.576, device API 1.4.351) — also reproduced on 610.57.04 (`driverVersion` 610.228.256, device API 1.4.341) |
+| OS | Linux (CachyOS, kernel 7.2.6) |
 | Loader | 1.4.357 |
 | App API version | Vulkan 1.4 |
-| Extensions | `VK_EXT_descriptor_heap` (spec v1), `VK_KHR_shader_untyped_pointers` |
-| Comparison device | AMD Radeon 7700X iGPU, RADV, Mesa 26.2.2 — **all cases pass** |
+| Extensions | `VK_EXT_descriptor_heap` (spec v1 on both branches), `VK_KHR_shader_untyped_pointers` |
+| Comparison device | AMD Radeon 7700X iGPU, RADV, Mesa 26.2.3 — **all cases pass** |
+
+The only relevant driver-reported difference between the two NVIDIA branches
+is `resourceHeapAlignment`, which went from 32 to 64 bytes. The repro derives
+every offset from the reported properties, so this changes nothing about the
+result.
 
 ## Build and run
 
@@ -45,7 +52,7 @@ reproduced.
 
 ## Observed output
 
-NVIDIA 610.57.04, abridged:
+NVIDIA 615.71.09, abridged:
 
 ```
   Part 1 of 2: CONTROL CASES (compute)
@@ -68,7 +75,7 @@ RESULT: heap slot 0 reads correctly, but a CONSTANT heap index of 1
         reads the wrong descriptor (B failed 40/40 frames).
 ```
 
-Mesa RADV 26.2.2: every case passes, exit code 0.
+Mesa RADV 26.2.3: every case passes, exit code 0.
 
 The heap has two slots, both written with `vkWriteResourceDescriptorsEXT` at
 init: slot 0 holds a uniform buffer with two colours (red, green), slot 1
@@ -89,7 +96,7 @@ simply being clamped to zero.
 
 ## What works and what does not
 
-| Stage | Index kind | Index value | NVIDIA | RADV |
+| Stage | Index kind | Index value | NVIDIA (610 & 615) | RADV |
 |---|---|---|---|---|
 | compute | constant | 0–3 | pass | pass |
 | compute | dynamic, from storage buffer | 0–3 | pass | pass |

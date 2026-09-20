@@ -8,7 +8,7 @@
 //
 //   Part 2, the repro (graphics_repro.cpp)  - a fragment shader reading a
 //           descriptor heap at a constant index of 1. Fails on NVIDIA
-//           610.57.04, passes on Mesa RADV.
+//           610.57.04 and 615.71.09, passes on Mesa RADV.
 //
 // Exit code 0 means no bug was observed; 1 means the repro reproduced.
 
