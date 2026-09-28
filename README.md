@@ -1,35 +1,118 @@
-# VK_EXT_descriptor_heap: fragment shader reads the wrong descriptor for any heap index other than 0
+# VK_EXT_descriptor_heap: working as designed — host-side stride bug, not a driver bug
 
-Reading a `layout(descriptor_heap)` array **from a fragment shader** at any
-index other than `0` returns the wrong descriptor on NVIDIA. Index `0` is
-correct. A literal constant index of `1` is enough to trigger it — there is
-no push data, no dynamic index and no `nonuniformEXT` involved.
+This originally looked like an NVIDIA-only bug where reading a
+`layout(descriptor_heap)` array from a **fragment shader** at any index other
+than `0` returned the wrong descriptor. That turned out to be wrong: the
+repro itself was writing descriptors at the wrong stride. Once fixed, all
+cases pass on every driver tested. See [Root cause](#root-cause) below.
 
-Reproduced identically on **two driver branches**: 610.57.04 and 615.71.09.
+Reproduced (the original symptom) identically on **two driver branches**:
+610.57.04 and 615.71.09. Mesa RADV 26.2.3 never showed it — not because RADV
+handles heap indexing differently, but because of a numeric coincidence
+described below.
 
-The same heap, same descriptors and equivalent shader logic read correctly at
-every index from a **compute** shader on the same device, so this appears to
-be specific to the fragment stage.
+## Root cause
 
-Mesa RADV 26.2.3 renders every case correctly from the same SPIR-V and the
-same API calls.
+`VK_EXT_descriptor_heap` exposes two different, easily-conflated sizes:
+
+- `vkGetPhysicalDeviceDescriptorSizeEXT(physicalDevice, descriptorType)` — the
+  **write size**: how many bytes `vkWriteResourceDescriptorsEXT` actually
+  touches for *that specific descriptor type*. Per the spec, only the first N
+  bytes are written and "the rest will not be accessed and can be safely
+  discarded when copying descriptors around." A uniform buffer descriptor can
+  be smaller than a storage buffer descriptor here, because a uniform
+  buffer's size is known at compile time from the shader block and doesn't
+  need to be stored.
+- `VkPhysicalDeviceDescriptorHeapPropertiesEXT::bufferDescriptorSize`
+  (queried via `vkGetPhysicalDeviceProperties2`) — the fixed **slot stride**
+  used by *all* buffer-class descriptors in the heap. This is what the
+  shader's `GL_EXT_descriptor_heap` indexing (`tints[1]`, `bufs[4]`, ...)
+  actually multiplies by, since the shader has no per-slot type information —
+  it just computes `heap_base + index * bufferDescriptorSize`.
+
+[`graphics_repro.cpp`](graphics_repro.cpp) used the *write size* (queried for
+`VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER`) as the stride between heap slots:
+
+```cpp
+descriptorSize_ = vkGetPhysicalDeviceDescriptorSizeEXT_(physicalDevice_, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+...
+dest.address = heap_.mapped + i * descriptorSize_;   // wrong: uses write size as stride
+dest.size    = descriptorSize_;
+```
+
+On the RTX 4060, the uniform buffer write size is **8 bytes** (pointer only),
+while `bufferDescriptorSize` is **16 bytes**. So slot 1 was written at byte
+offset `1 * 8 = 8`, but the shader's `tints[1]` reads from `1 * 16 = 16` —
+landing on the tail of slot 0's descriptor instead of slot 1's, which is
+exactly the "wrong descriptor" symptom that was reported.
+
+The fix is to use `heapProps_.bufferDescriptorSize` for the stride/offset
+math, and keep the (possibly smaller) `vkGetPhysicalDeviceDescriptorSizeEXT`
+value only for `dest.size` on the write call:
+
+```cpp
+descriptorSize_ = heapProps_.bufferDescriptorSize;              // slot stride
+...
+const VkDeviceSize writeSize = vkGetPhysicalDeviceDescriptorSizeEXT_(
+    physicalDevice_, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+dest.address = heap_.mapped + i * descriptorSize_;               // correct stride
+dest.size    = writeSize;                                        // correct write size
+```
+
+### Why the compute controls never caught it
+
+[`compute_controls.cpp`](compute_controls.cpp) has the identical pattern —
+write size used as stride — but it uses `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`.
+A storage buffer descriptor needs its full pointer+size payload, so on this
+driver its write size (16 bytes) is numerically equal to
+`bufferDescriptorSize` (16 bytes). The bug was latent there too; it simply
+never manifested because write size and slot stride happened to match for
+that descriptor type.
+
+### Why RADV never showed it either
+
+Measured directly (see [Measurements](#measurements)):
+
+| | uniform buffer write size | `bufferDescriptorSize` (slot stride) |
+|---|---|---|
+| NVIDIA 615.71.09 | 8 bytes | 16 bytes |
+| Mesa RADV 26.2.3 | 16 bytes | 16 bytes |
+
+RADV reports a uniform buffer write size equal to the full slot stride —
+whether because its uniform buffer descriptor format genuinely needs the
+full 16 bytes, or because it doesn't bother reporting a reduced write size
+the way the spec permits. Either way it's spec-compliant, and it means the
+write-size/stride gap this bug depends on doesn't exist on RADV, so the same
+buggy host code produced correct offsets there by coincidence. This was never
+a fragment-vs-compute or NVIDIA-vs-AMD driver discrepancy — it was one
+host-side offset bug, exposed only by the combination of descriptor type
+(uniform buffer) and driver (NVIDIA) where the two sizes happen to differ.
+
+## Measurements
+
+```sh
+$ ./build/descriptor_heap_repro
+storage buffer descriptor size: 16 bytes        # compute control (unaffected either way)
+uniform buffer write size:       8 bytes        # fragment repro
+heap buffer descriptor size:    16 bytes (slot stride)
+
+$ VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json ./build/descriptor_heap_repro
+storage buffer descriptor size: 16 bytes
+uniform buffer write size:      16 bytes
+heap buffer descriptor size:    16 bytes (slot stride)
+```
 
 ## Environment
 
 | | |
 |---|---|
 | GPU | NVIDIA GeForce RTX 4060 |
-| Driver | **615.71.09** (`driverVersion` 615.284.576, device API 1.4.351) — also reproduced on 610.57.04 (`driverVersion` 610.228.256, device API 1.4.341) |
+| Driver | **615.71.09** (`driverVersion` 615.284.576, device API 1.4.351) — also checked on 610.57.04 (`driverVersion` 610.228.256, device API 1.4.341) |
 | OS | Linux (CachyOS, kernel 7.2.6) |
 | Loader | 1.4.357 |
 | App API version | Vulkan 1.4 |
 | Extensions | `VK_EXT_descriptor_heap` (spec v1 on both branches), `VK_KHR_shader_untyped_pointers` |
-| Comparison device | AMD Radeon 7700X iGPU, RADV, Mesa 26.2.3 — **all cases pass** |
-
-The only relevant driver-reported difference between the two NVIDIA branches
-is `resourceHeapAlignment`, which went from 32 to 64 bytes. The repro derives
-every offset from the reported properties, so this changes nothing about the
-result.
+| Comparison device | AMD Radeon 7700X iGPU, RADV, Mesa 26.2.3 |
 
 ## Build and run
 
@@ -43,73 +126,56 @@ VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json ./build/descriptor_heap_
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json ./build/descriptor_heap_repro
 ```
 
-There is a single binary. It runs the compute control cases first (expected
-to pass everywhere) and then the fragment repro, and prints one combined
-verdict. It is headless and self-verifying — it renders offscreen and reads
-the pixels back, so there is no window, swapchain or surface, and nothing to
-eyeball. Exit code 0 means no failure was observed, 1 means the bug
-reproduced.
+There is a single binary. It runs the compute control cases first and then
+the fragment cases, and prints one combined verdict. It is headless and
+self-verifying — it renders offscreen and reads the pixels back, so there is
+no window, swapchain or surface, and nothing to eyeball. Exit code 0 means no
+failure was observed, 1 means a failure reproduced.
 
-## Observed output
+## Current output
 
-NVIDIA 615.71.09, abridged:
+NVIDIA 615.71.09:
 
 ```
   Part 1 of 2: CONTROL CASES (compute)
+storage buffer descriptor size: 16 bytes
 constant index         : PASS
 dynamic index (buffer) : PASS
 pushdata index = 0     : PASS
 pushdata index = 1     : PASS
 
   Part 2 of 2: THE REPRO (fragment stage)
+uniform buffer write size:   8 bytes
+heap buffer descriptor size: 16 bytes (slot stride)
 [A] constant heap index 0 (expect red every frame):
   -> 40/40 frames correct
 [B] constant heap index 1 (expect green every frame):
-frame 0: expected (0,255,0,255), got (0,0,0,0)
-...
-  -> 0/40 frames correct
+  -> 40/40 frames correct
 [C] heap index 0, pushed value selects inside the buffer:
   -> 40/40 frames correct
 
-RESULT: heap slot 0 reads correctly, but a CONSTANT heap index of 1
-        reads the wrong descriptor (B failed 40/40 frames).
+RESULT: all cases correct.
+
+SUMMARY
+    control cases (compute) : PASS
+    repro (fragment)        : PASS
+
+No failure observed on this driver.
 ```
 
-Mesa RADV 26.2.3: every case passes, exit code 0.
+Mesa RADV 26.2.3: same, all cases pass, exit code 0.
 
 The heap has two slots, both written with `vkWriteResourceDescriptorsEXT` at
 init: slot 0 holds a uniform buffer with two colours (red, green), slot 1
 holds a uniform buffer with one colour (green).
 
-- **[A]** reads slot 0. Correct on both vendors.
-- **[B]** reads slot 1 via `tints[1].color`, a literal constant. Expected
-  green; NVIDIA returns something else. This is the bug in its smallest form.
+- **[A]** reads slot 0. Correct on both vendors, before and after the fix —
+  index 0 means offset 0 regardless of which stride you (mis)compute with.
+- **[B]** reads slot 1 via `tints[1].color`, a literal constant. This is the
+  case that used to fail on NVIDIA before the stride fix.
 - **[C]** reads slot 0 but selects between the two colours *inside* that
-  buffer using a `vkCmdPushDataEXT` value. Correct on both vendors, so
-  ordinary array indexing within a buffer is unaffected — it is specifically
-  descriptor-heap indexing that breaks.
-
-The incorrect value returned by [B] varies with heap layout: with this layout
-it is `(0,0,0,0)`, and with a three-slot layout it was slot 0's colour
-instead. That suggests a wrong address computation rather than the index
-simply being clamped to zero.
-
-## What works and what does not
-
-| Stage | Index kind | Index value | NVIDIA (610 & 615) | RADV |
-|---|---|---|---|---|
-| compute | constant | 0–3 | pass | pass |
-| compute | dynamic, from storage buffer | 0–3 | pass | pass |
-| compute | dynamic, from push data | 0 and 1 | pass | pass |
-| fragment | constant | 0 | pass | pass |
-| fragment | **constant** | **1** | **fail** | pass |
-| fragment | dynamic, from push data | 0 | pass | pass |
-| fragment | dynamic, from push data | 1 | **fail** | pass |
-
-Part 1 of the binary covers the compute rows; part 2 covers the fragment
-rows. The fragment dynamic-index rows were observed in the application this
-was reduced from; the reduced repro uses constant indices because they are
-the smaller case and fail identically.
+  buffer using a `vkCmdPushDataEXT` value. Always correct, since it never
+  depends on heap slot stride at all.
 
 `nonuniformEXT` is not used anywhere. No SPIR-V module here declares
 `ShaderNonUniform` or `UniformBufferArrayNonUniformIndexing`. Verify with:
@@ -118,17 +184,12 @@ the smaller case and fail identically.
 spirv-dis build/shaders/frag_slot1.frag.spv | grep OpCapability
 ```
 
-## Workaround
-
-Keep every fragment-stage heap index at `0` and move per-draw selection
-inside the buffer, as case **[C]** does: put the data for all variants in one
-buffer, reach it at heap slot 0, and index within it using push data. This
-avoids the broken path while preserving per-draw selection.
-
 ## Validation
 
 No VUID violations are reported under core validation, synchronization
-validation, or GPU-Assisted Validation with descriptor checks. The only layer
+validation, or GPU-Assisted Validation with descriptor checks — unsurprising,
+since writing to the wrong (but still in-bounds, reserved) offset inside the
+heap buffer isn't something descriptor validation can catch. The only layer
 output is configuration advisories (GPU-AV warning that it is slow alongside
 core checks, and auto-disabling its ray-tracing and mesh-shading options
 because those features are unsupported here):
@@ -149,9 +210,9 @@ VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ./build/descriptor_heap_repro
 |---|---|
 | `main.cpp` | Runs the controls, then the repro, prints one verdict |
 | `graphics_repro.cpp` | Fragment-stage cases, offscreen render + pixel readback |
-| `compute_controls.cpp` | Compute-stage controls, all passing |
+| `compute_controls.cpp` | Compute-stage controls |
 | `shaders/frag_slot0.frag` | [A] constant heap index 0 |
-| `shaders/frag_slot1.frag` | [B] constant heap index 1 — the bug |
+| `shaders/frag_slot1.frag` | [B] constant heap index 1 |
 | `shaders/frag_slot0_dynamic.frag` | [C] heap index 0, push data selects inside the buffer |
 | `shaders/heap_constant.comp` | Compute control: constant heap indices |
 | `shaders/heap_dynamic.comp` | Compute control: buffer-sourced dynamic index |

@@ -339,14 +339,25 @@ private:
     }
 
     void createHeap() {
-        descriptorSize_ =
-            vkGetPhysicalDeviceDescriptorSizeEXT_(physicalDevice_, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        // Stride between heap slots: this must match what the shader's
+        // GL_EXT_descriptor_heap indexing assumes, which is the fixed
+        // per-resource-class size from the heap properties -- NOT the
+        // smaller "only these bytes get written" size that
+        // vkGetPhysicalDeviceDescriptorSizeEXT reports for a specific
+        // descriptor type.
+        descriptorSize_ = heapProps_.bufferDescriptorSize;
         reservedOffset_ = alignUp(descriptorSize_ * kHeapSlots, heapProps_.resourceHeapAlignment);
         reservedSize_ =
             alignUp(heapProps_.minResourceHeapReservedRange, heapProps_.resourceHeapAlignment);
 
         heap_ = createBuffer(reservedOffset_ + reservedSize_, VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT,
                              true);
+
+        const VkDeviceSize writeSize = vkGetPhysicalDeviceDescriptorSizeEXT_(
+            physicalDevice_, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+        std::cout << "uniform buffer write size:   " << writeSize << " bytes\n"
+                  << "heap buffer descriptor size: " << descriptorSize_ << " bytes (slot stride)\n";
 
         for (uint32_t i = 0; i < kHeapSlots; ++i) {
             VkDeviceAddressRangeEXT range{};
@@ -360,7 +371,7 @@ private:
 
             VkHostAddressRangeEXT dest{};
             dest.address = static_cast<uint8_t*>(heap_.mapped) + i * descriptorSize_;
-            dest.size = descriptorSize_;
+            dest.size = writeSize;
             VK_CHECK(vkWriteResourceDescriptorsEXT_(device_, 1, &info, &dest));
         }
     }
